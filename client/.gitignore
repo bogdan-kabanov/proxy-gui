@@ -1,0 +1,14 @@
+node_modules/
+dist/
+dist-electron/
+release/
+resources/sing-box/*.exe
+resources/sing-box/*.dll
+resources/sing-box/*.zip
+resources/sing-box/extract/
+*.log
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
