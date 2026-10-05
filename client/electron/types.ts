@@ -121,5 +121,7 @@ export interface AppProfilePatch {
 export interface BulkImportResult {
   imported: number
   skipped: number
+  tested: number
+  failed: number
   profile: AppProfile
 }

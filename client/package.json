@@ -1,6 +1,6 @@
 {
   "name": "proxy-gui",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "author": "bogdan-kabanov",
   "description": "Proxifier-like GUI client for SOCKS/HTTPS proxies with TUN and system proxy modes",
   "main": "dist-electron/main.js",

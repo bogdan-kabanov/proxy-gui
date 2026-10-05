@@ -13,7 +13,8 @@ interface ProxiesPageProps {
   on_save: (proxy: ProxyServer, is_new: boolean) => Promise<void>
   on_delete: (proxy_id: string) => Promise<void>
   on_import: (line: string) => Promise<void>
-  on_import_bulk: (text: string) => Promise<{ imported: number; skipped: number }>
+  on_import_bulk: (text: string) => Promise<{ imported: number; skipped: number; tested: number; failed: number }>
+  on_import_files: () => Promise<{ imported: number; skipped: number; tested: number; failed: number }>
   on_check: (proxy: ProxyServer) => Promise<ProxyCheckResult>
   on_check_all: () => Promise<void>
   on_select: (proxy_id: string) => Promise<void>
@@ -52,6 +53,7 @@ export function ProxiesPage({
   on_delete,
   on_import,
   on_import_bulk,
+  on_import_files,
   on_check,
   on_check_all,
   on_select,
@@ -65,6 +67,7 @@ export function ProxiesPage({
   const [checking_id, set_checking_id] = useState<string | null>(null)
   const [group_form, set_group_form] = useState<ProxyGroup>(create_empty_group())
   const [checking_all, set_checking_all] = useState(false)
+  const [importing_files, set_importing_files] = useState(false)
   const is_editing = Boolean(form.id)
 
   const sorted_proxies = useMemo(
@@ -403,6 +406,26 @@ export function ProxiesPage({
           </div>
           <div className="panel_body stack">
             <div className="field">
+              <label>Файлы провайдера (.txt)</label>
+              <div className="field_hint">
+                Поддерживаются: plain, http://, socks5://, user:pass@host:port. Можно выбрать несколько
+                файлов сразу — рабочие прокси сами проверяются и добавляются.
+              </div>
+            </div>
+            <div className="row_actions">
+              <button
+                className="btn btn_primary"
+                type="button"
+                disabled={importing_files}
+                onClick={() => {
+                  set_importing_files(true)
+                  void on_import_files().finally(() => set_importing_files(false))
+                }}
+              >
+                {importing_files ? 'Тестирую…' : 'Import .txt files'}
+              </button>
+            </div>
+            <div className="field">
               <label htmlFor="import_line">Одна строка host:port:user:pass</label>
               <input
                 id="import_line"
@@ -428,20 +451,20 @@ export function ProxiesPage({
                 id="bulk_text"
                 value={bulk_text}
                 onChange={(event) => set_bulk_text(event.target.value)}
-                placeholder={'host:port:user:pass\nhost2:port:user:pass'}
+                placeholder={'host:port:user:pass\nhttp://user:pass@host:port\nsocks5://user:pass@host:port'}
                 rows={6}
               />
-              <div className="field_hint">Протокол определяется автоматически при импорте</div>
+              <div className="field_hint">При импорте строки тестируются; мёртвые не добавляются</div>
             </div>
             <div className="row_actions">
               <button
-                className="btn btn_primary"
+                className="btn btn_secondary"
                 type="button"
                 onClick={() => {
                   void on_import_bulk(bulk_text).then(() => set_bulk_text(''))
                 }}
               >
-                Bulk import
+                Bulk import + test
               </button>
             </div>
           </div>

@@ -14,6 +14,7 @@ import {
   bulk_import_proxies,
   export_profile,
   import_profile,
+  import_proxy_files,
   load_profile,
   parse_proxy_line,
   patch_profile,
@@ -187,7 +188,30 @@ function register_ipc(): void {
     })
   })
 
-  ipcMain.handle('proxy_import_bulk', async (_event, text: string) => bulk_import_proxies(text))
+  ipcMain.handle('proxy_import_bulk', async (_event, text: string) =>
+    bulk_import_proxies(text, { test: true }),
+  )
+
+  ipcMain.handle('proxy_import_files', async () => {
+    const result = await dialog.showOpenDialog(main_window ?? undefined, {
+      title: 'Импорт прокси из .txt',
+      properties: ['openFile', 'multiSelections'],
+      filters: [
+        { name: 'Proxy lists', extensions: ['txt'] },
+        { name: 'All files', extensions: ['*'] },
+      ],
+    })
+    if (result.canceled || result.filePaths.length === 0) {
+      return {
+        imported: 0,
+        skipped: 0,
+        tested: 0,
+        failed: 0,
+        profile: load_profile(),
+      }
+    }
+    return import_proxy_files(result.filePaths, { test: true })
+  })
 
   ipcMain.handle('proxy_check', async (_event, proxy: ProxyServer) => check_proxy(proxy))
 

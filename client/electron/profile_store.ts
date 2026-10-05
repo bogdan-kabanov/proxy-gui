@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { app } from 'electron'
 import { randomUUID } from 'node:crypto'
-import { detect_proxy_protocol_quick } from './proxy_check'
+import { check_proxy_full, detect_proxy_protocol_quick } from './proxy_check'
 import type {
   AppProfile,
   AppProfilePatch,
@@ -235,28 +235,79 @@ export function get_runtime_config_path(): string {
   return path.join(get_profile_dir(), 'sing-box-runtime.json')
 }
 
-export function parse_proxy_line(line: string): Omit<ProxyServer, 'id' | 'enabled' | 'name' | 'last_latency_ms' | 'last_exit_ip' | 'last_checked_at'> | null {
-  const parts = line.trim().split(':')
+type ParsedProxyLine = Omit<
+  ProxyServer,
+  'id' | 'enabled' | 'name' | 'last_latency_ms' | 'last_exit_ip' | 'last_checked_at'
+>
+
+function proxy_key(proxy: Pick<ProxyServer, 'host' | 'port' | 'username' | 'protocol'>): string {
+  return `${proxy.protocol}|${proxy.host}|${proxy.port}|${proxy.username}`
+}
+
+export function parse_proxy_line(line: string): ParsedProxyLine | null {
+  const trimmed = line.trim()
+  if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('//')) return null
+
+  const url_match = trimmed.match(
+    /^(https?|socks5?):\/\/(?:([^:@/\s]+):([^@/\s]*)@)?([^:/\s]+):(\d+)\/?$/i,
+  )
+  if (url_match) {
+    const scheme = url_match[1].toLowerCase()
+    const port = Number(url_match[5])
+    if (!Number.isFinite(port) || port <= 0 || port > 65535) return null
+    return {
+      host: url_match[4],
+      port,
+      protocol: scheme === 'socks5' || scheme === 'socks' ? 'socks5' : scheme === 'https' ? 'https' : 'http',
+      username: url_match[2] ?? '',
+      password: url_match[3] ?? '',
+    }
+  }
+
+  const userinfo_match = trimmed.match(/^([^:@\s]+):([^@\s]*)@([^:\s]+):(\d+)$/)
+  if (userinfo_match) {
+    const port = Number(userinfo_match[4])
+    if (!Number.isFinite(port) || port <= 0 || port > 65535) return null
+    return {
+      host: userinfo_match[3],
+      port,
+      protocol: 'http',
+      username: userinfo_match[1],
+      password: userinfo_match[2],
+    }
+  }
+
+  const parts = trimmed.split(':')
   if (parts.length < 2) return null
 
   const host = parts[0]
   const port = Number(parts[1])
   if (!host || !Number.isFinite(port) || port <= 0 || port > 65535) return null
 
-  const username = parts[2] ?? ''
-  const password = parts.slice(3).join(':')
-
   return {
     host,
     port,
     protocol: 'http',
-    username,
-    password,
+    username: parts[2] ?? '',
+    password: parts.slice(3).join(':'),
   }
 }
 
-export async function bulk_import_proxies(text: string): Promise<BulkImportResult> {
+function guess_protocol_from_filename(file_name: string): ProxyServer['protocol'] | null {
+  const lower = file_name.toLowerCase()
+  if (lower.includes('socks')) return 'socks5'
+  if (lower.includes('http')) return 'http'
+  return null
+}
+
+export async function bulk_import_proxies(
+  text: string,
+  options?: { test?: boolean; file_name?: string },
+): Promise<BulkImportResult> {
   const profile = load_profile()
+  const should_test = options?.test ?? false
+  const file_hint = options?.file_name ? guess_protocol_from_filename(options.file_name) : null
+
   const lines = text
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -264,7 +315,11 @@ export async function bulk_import_proxies(text: string): Promise<BulkImportResul
 
   let imported = 0
   let skipped = 0
+  let tested = 0
+  let failed = 0
   const new_proxies: ProxyServer[] = [...profile.proxies]
+  const existing_keys = new Set(new_proxies.map((item) => proxy_key(item)))
+  const seen_keys = new Set<string>()
 
   for (const line of lines) {
     const parsed = parse_proxy_line(line)
@@ -273,15 +328,77 @@ export async function bulk_import_proxies(text: string): Promise<BulkImportResul
       continue
     }
 
-    const protocol = await detect_proxy_protocol_quick(parsed)
+    if (file_hint && parsed.protocol === 'http' && !/^(https?|socks5?):\/\//i.test(line.trim())) {
+      parsed.protocol = file_hint
+    }
+
+    const dedupe_key = `${parsed.host}|${parsed.port}|${parsed.username}`
+    if (seen_keys.has(dedupe_key)) {
+      skipped += 1
+      continue
+    }
+    seen_keys.add(dedupe_key)
+
+    if (
+      new_proxies.some(
+        (item) =>
+          item.host === parsed.host &&
+          item.port === parsed.port &&
+          item.username === parsed.username,
+      )
+    ) {
+      skipped += 1
+      continue
+    }
+
+    let protocol = parsed.protocol
+    let last_latency_ms: number | null = null
+    let last_exit_ip: string | null = null
+    let last_checked_at: string | null = null
+
+    if (should_test) {
+      tested += 1
+      const candidate: ProxyServer = {
+        id: randomUUID(),
+        name: `${parsed.host}:${parsed.port}`,
+        enabled: true,
+        ...parsed,
+        protocol,
+        ...empty_proxy_meta(),
+      }
+      const result = await check_proxy_full(candidate, 10000)
+      if (!result.ok) {
+        failed += 1
+        continue
+      }
+      protocol = result.protocol ?? protocol
+      last_latency_ms = result.latency_ms
+      last_exit_ip = result.exit_ip
+      last_checked_at = new Date().toISOString()
+    } else {
+      protocol = await detect_proxy_protocol_quick(parsed)
+    }
+
     const proxy: ProxyServer = {
       id: randomUUID(),
       name: `${parsed.host}:${parsed.port}`,
       enabled: true,
-      ...parsed,
+      host: parsed.host,
+      port: parsed.port,
+      username: parsed.username,
+      password: parsed.password,
       protocol,
-      ...empty_proxy_meta(),
+      last_latency_ms,
+      last_exit_ip,
+      last_checked_at,
     }
+
+    if (existing_keys.has(proxy_key(proxy))) {
+      skipped += 1
+      continue
+    }
+
+    existing_keys.add(proxy_key(proxy))
     new_proxies.push(proxy)
     imported += 1
   }
@@ -291,7 +408,34 @@ export async function bulk_import_proxies(text: string): Promise<BulkImportResul
     selected_proxy_id: profile.selected_proxy_id ?? new_proxies[0]?.id ?? null,
   })
 
-  return { imported, skipped, profile: next }
+  return { imported, skipped, tested, failed, profile: next }
+}
+
+export async function import_proxy_files(
+  file_paths: string[],
+  options?: { test?: boolean },
+): Promise<BulkImportResult> {
+  const should_test = options?.test ?? true
+  let imported = 0
+  let skipped = 0
+  let tested = 0
+  let failed = 0
+  let profile = load_profile()
+
+  for (const file_path of file_paths) {
+    const text = fs.readFileSync(file_path, 'utf8')
+    const result = await bulk_import_proxies(text, {
+      test: should_test,
+      file_name: path.basename(file_path),
+    })
+    imported += result.imported
+    skipped += result.skipped
+    tested += result.tested
+    failed += result.failed
+    profile = result.profile
+  }
+
+  return { imported, skipped, tested, failed, profile }
 }
 
 export function export_profile(): string {

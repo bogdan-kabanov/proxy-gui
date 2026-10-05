@@ -32,6 +32,7 @@ const api = {
     ipcRenderer.invoke('proxy_import_line', line),
   proxy_import_bulk: (text: string): Promise<BulkImportResult> =>
     ipcRenderer.invoke('proxy_import_bulk', text),
+  proxy_import_files: (): Promise<BulkImportResult> => ipcRenderer.invoke('proxy_import_files'),
   proxy_check: (proxy: ProxyServer): Promise<ProxyCheckResult> =>
     ipcRenderer.invoke('proxy_check', proxy),
   proxy_check_all: (): Promise<AppProfile> => ipcRenderer.invoke('proxy_check_all'),

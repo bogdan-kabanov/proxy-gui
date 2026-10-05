@@ -182,8 +182,31 @@ export default function App() {
   const on_proxy_import_bulk = async (text: string) => {
     const result = await window.proxy_gui.proxy_import_bulk(text)
     apply_profile(result.profile)
-    show_toast(`Импортировано: ${result.imported}, пропущено: ${result.skipped}`, 'ok')
-    return { imported: result.imported, skipped: result.skipped }
+    show_toast(
+      `OK: ${result.imported}, fail: ${result.failed}, skip: ${result.skipped}`,
+      result.imported > 0 ? 'ok' : 'error',
+    )
+    return {
+      imported: result.imported,
+      skipped: result.skipped,
+      tested: result.tested,
+      failed: result.failed,
+    }
+  }
+
+  const on_proxy_import_files = async () => {
+    const result = await window.proxy_gui.proxy_import_files()
+    apply_profile(result.profile)
+    show_toast(
+      `Файлы: добавлено ${result.imported}, не прошли тест ${result.failed}, пропущено ${result.skipped}`,
+      result.imported > 0 ? 'ok' : 'info',
+    )
+    return {
+      imported: result.imported,
+      skipped: result.skipped,
+      tested: result.tested,
+      failed: result.failed,
+    }
   }
 
   const on_proxy_check = async (proxy: ProxyServer) => {
@@ -362,6 +385,7 @@ export default function App() {
               on_delete={on_proxy_delete}
               on_import={on_proxy_import}
               on_import_bulk={on_proxy_import_bulk}
+              on_import_files={on_proxy_import_files}
               on_check={on_proxy_check}
               on_check_all={on_proxy_check_all}
               on_select={on_select_proxy}
