@@ -2,15 +2,18 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { app } from 'electron'
 import { randomUUID } from 'node:crypto'
+import { detect_proxy_protocol_quick } from './proxy_check'
 import type {
   AppProfile,
   AppProfilePatch,
   AppSettings,
+  BulkImportResult,
   ProxificationRule,
+  ProxyGroup,
   ProxyServer,
 } from './types'
 
-const PROFILE_VERSION = 1
+const PROFILE_VERSION = 2
 
 const DEFAULT_SETTINGS: AppSettings = {
   mixed_port: 7890,
@@ -18,18 +21,18 @@ const DEFAULT_SETTINGS: AppSettings = {
   dns_via_proxy: true,
   auto_connect: false,
   default_action: 'proxy',
+  start_with_windows: false,
+  minimize_to_tray: true,
+  use_proxy_group: false,
+  selected_group_id: null,
+  auto_check_updates: true,
 }
 
-function create_seed_proxy(): ProxyServer {
+function empty_proxy_meta(): Pick<ProxyServer, 'last_latency_ms' | 'last_exit_ip' | 'last_checked_at'> {
   return {
-    id: randomUUID(),
-    name: 'Seed HTTP',
-    host: '45.11.183.190',
-    port: 11707,
-    protocol: 'http',
-    username: 'modeler_TBbGST',
-    password: 'GxBi5GsRDlbV',
-    enabled: true,
+    last_latency_ms: null,
+    last_exit_ip: null,
+    last_checked_at: null,
   }
 }
 
@@ -69,13 +72,13 @@ function create_default_rules(): ProxificationRule[] {
 }
 
 function create_default_profile(): AppProfile {
-  const seed_proxy = create_seed_proxy()
   return {
     version: PROFILE_VERSION,
-    selected_proxy_id: seed_proxy.id,
+    selected_proxy_id: null,
     work_mode: 'proxy',
     settings: { ...DEFAULT_SETTINGS },
-    proxies: [seed_proxy],
+    proxies: [],
+    proxy_groups: [],
     rules: create_default_rules(),
   }
 }
@@ -122,30 +125,40 @@ function is_rule(value: unknown): value is ProxificationRule {
   )
 }
 
+function is_proxy_group(value: unknown): value is ProxyGroup {
+  if (!value || typeof value !== 'object') return false
+  const item = value as Record<string, unknown>
+  return (
+    typeof item.id === 'string' &&
+    typeof item.name === 'string' &&
+    Array.isArray(item.proxy_ids) &&
+    (item.mode === 'select' || item.mode === 'urltest') &&
+    (item.selected_proxy_id === null || typeof item.selected_proxy_id === 'string')
+  )
+}
+
+function normalize_proxy(raw: ProxyServer): ProxyServer {
+  return {
+    ...raw,
+    ...empty_proxy_meta(),
+    last_latency_ms: typeof raw.last_latency_ms === 'number' ? raw.last_latency_ms : null,
+    last_exit_ip: typeof raw.last_exit_ip === 'string' ? raw.last_exit_ip : null,
+    last_checked_at: typeof raw.last_checked_at === 'string' ? raw.last_checked_at : null,
+  }
+}
+
 function normalize_profile(raw: unknown): AppProfile {
   const fallback = create_default_profile()
   if (!raw || typeof raw !== 'object') return fallback
 
   const data = raw as Partial<AppProfile>
-  let proxies = Array.isArray(data.proxies)
-    ? data.proxies.filter(is_proxy_server)
+  const proxies = Array.isArray(data.proxies)
+    ? data.proxies.filter(is_proxy_server).map(normalize_proxy)
     : fallback.proxies
 
-  // Seed proxy was initially saved as SOCKS5 by mistake; it speaks HTTP CONNECT.
-  proxies = proxies.map((proxy) => {
-    if (
-      proxy.host === '45.11.183.190' &&
-      proxy.port === 11707 &&
-      proxy.protocol === 'socks5'
-    ) {
-      return {
-        ...proxy,
-        protocol: 'http',
-        name: proxy.name.includes('SOCKS') ? 'Seed HTTP' : proxy.name,
-      }
-    }
-    return proxy
-  })
+  const proxy_groups = Array.isArray(data.proxy_groups)
+    ? data.proxy_groups.filter(is_proxy_group)
+    : fallback.proxy_groups
 
   const rules = Array.isArray(data.rules) ? data.rules.filter(is_rule) : fallback.rules
 
@@ -155,6 +168,12 @@ function normalize_profile(raw: unknown): AppProfile {
       ? data.selected_proxy_id
       : proxies[0]?.id ?? null
 
+  const selected_group_id =
+    typeof data.settings?.selected_group_id === 'string' &&
+    proxy_groups.some((group) => group.id === data.settings?.selected_group_id)
+      ? data.settings.selected_group_id
+      : proxy_groups[0]?.id ?? null
+
   return {
     version: PROFILE_VERSION,
     selected_proxy_id,
@@ -162,8 +181,10 @@ function normalize_profile(raw: unknown): AppProfile {
     settings: {
       ...DEFAULT_SETTINGS,
       ...(data.settings ?? {}),
+      selected_group_id,
     },
-    proxies: proxies.length > 0 ? proxies : fallback.proxies,
+    proxies,
+    proxy_groups,
     rules: rules.length > 0 ? rules : fallback.rules,
   }
 }
@@ -204,6 +225,7 @@ export function patch_profile(patch: AppProfilePatch): AppProfile {
       ...(patch.settings ?? {}),
     },
     proxies: patch.proxies ?? current.proxies,
+    proxy_groups: patch.proxy_groups ?? current.proxy_groups,
     rules: patch.rules ?? current.rules,
   }
   return save_profile(next)
@@ -213,7 +235,7 @@ export function get_runtime_config_path(): string {
   return path.join(get_profile_dir(), 'sing-box-runtime.json')
 }
 
-export function parse_proxy_line(line: string): Omit<ProxyServer, 'id' | 'enabled' | 'name'> | null {
+export function parse_proxy_line(line: string): Omit<ProxyServer, 'id' | 'enabled' | 'name' | 'last_latency_ms' | 'last_exit_ip' | 'last_checked_at'> | null {
   const parts = line.trim().split(':')
   if (parts.length < 2) return null
 
@@ -233,4 +255,73 @@ export function parse_proxy_line(line: string): Omit<ProxyServer, 'id' | 'enable
   }
 }
 
-export { create_default_profile, create_seed_proxy, DEFAULT_SETTINGS }
+export async function bulk_import_proxies(text: string): Promise<BulkImportResult> {
+  const profile = load_profile()
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+
+  let imported = 0
+  let skipped = 0
+  const new_proxies: ProxyServer[] = [...profile.proxies]
+
+  for (const line of lines) {
+    const parsed = parse_proxy_line(line)
+    if (!parsed) {
+      skipped += 1
+      continue
+    }
+
+    const protocol = await detect_proxy_protocol_quick(parsed)
+    const proxy: ProxyServer = {
+      id: randomUUID(),
+      name: `${parsed.host}:${parsed.port}`,
+      enabled: true,
+      ...parsed,
+      protocol,
+      ...empty_proxy_meta(),
+    }
+    new_proxies.push(proxy)
+    imported += 1
+  }
+
+  const next = patch_profile({
+    proxies: new_proxies,
+    selected_proxy_id: profile.selected_proxy_id ?? new_proxies[0]?.id ?? null,
+  })
+
+  return { imported, skipped, profile: next }
+}
+
+export function export_profile(): string {
+  const profile = load_profile()
+  return JSON.stringify(profile, null, 2)
+}
+
+export function import_profile(json_text: string): AppProfile {
+  const raw = JSON.parse(json_text) as unknown
+  const profile = normalize_profile(raw)
+  return save_profile(profile)
+}
+
+export function update_proxy_check_meta(
+  proxy_id: string,
+  meta: Pick<ProxyServer, 'last_latency_ms' | 'last_exit_ip' | 'last_checked_at' | 'protocol'>,
+): AppProfile {
+  const profile = load_profile()
+  const proxies = profile.proxies.map((item) =>
+    item.id === proxy_id
+      ? {
+          ...item,
+          last_latency_ms: meta.last_latency_ms,
+          last_exit_ip: meta.last_exit_ip,
+          last_checked_at: meta.last_checked_at,
+          protocol: meta.protocol ?? item.protocol,
+        }
+      : item,
+  )
+  return patch_profile({ proxies })
+}
+
+export { create_default_profile, DEFAULT_SETTINGS }

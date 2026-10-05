@@ -4,6 +4,7 @@ import type {
   ConnectionStatus,
   LiveConnection,
   ProxificationRule,
+  ProxyGroup,
   ProxyServer,
   WorkMode,
 } from './types'
@@ -90,6 +91,11 @@ export default function App() {
 
   const selected_proxy = useMemo(() => {
     if (!profile) return null
+    if (profile.settings.use_proxy_group && profile.settings.selected_group_id) {
+      const group = profile.proxy_groups.find((item) => item.id === profile.settings.selected_group_id)
+      const first_id = group?.proxy_ids[0]
+      return profile.proxies.find((item) => item.id === first_id) ?? null
+    }
     return profile.proxies.find((item) => item.id === profile.selected_proxy_id) ?? null
   }, [profile])
 
@@ -117,11 +123,7 @@ export default function App() {
     try {
       const next_status = await window.proxy_gui.connection_start()
       set_status(next_status)
-      if (next_status.state === 'connected') {
-        show_toast(next_status.message, 'ok')
-      } else {
-        show_toast(next_status.message, 'error')
-      }
+      show_toast(next_status.message, next_status.state === 'connected' ? 'ok' : 'error')
       await refresh_all()
     } catch (error) {
       show_toast(String(error), 'error')
@@ -177,10 +179,47 @@ export default function App() {
     show_toast('Прокси импортирован', 'ok')
   }
 
+  const on_proxy_import_bulk = async (text: string) => {
+    const result = await window.proxy_gui.proxy_import_bulk(text)
+    apply_profile(result.profile)
+    show_toast(`Импортировано: ${result.imported}, пропущено: ${result.skipped}`, 'ok')
+    return { imported: result.imported, skipped: result.skipped }
+  }
+
   const on_proxy_check = async (proxy: ProxyServer) => {
     const result = await window.proxy_gui.proxy_check(proxy)
+    const next_profile = await window.proxy_gui.profile_get()
+    apply_profile(next_profile)
     show_toast(result.message, result.ok ? 'ok' : 'error')
     return result
+  }
+
+  const on_proxy_check_all = async () => {
+    const next = await window.proxy_gui.proxy_check_all()
+    apply_profile(next)
+    show_toast('Latency check завершён', 'ok')
+  }
+
+  const on_group_save = async (group: ProxyGroup) => {
+    const next = await window.proxy_gui.proxy_group_upsert(group)
+    apply_profile(next)
+    show_toast('Группа сохранена', 'ok')
+  }
+
+  const on_group_delete = async (group_id: string) => {
+    const next = await window.proxy_gui.proxy_group_delete(group_id)
+    apply_profile(next)
+    show_toast('Группа удалена', 'ok')
+  }
+
+  const on_use_group_change = async (use_group: boolean, group_id: string | null) => {
+    if (!profile) return
+    const next = await window.proxy_gui.settings_update({
+      ...profile.settings,
+      use_proxy_group: use_group,
+      selected_group_id: group_id,
+    })
+    apply_profile(next)
   }
 
   const on_rule_upsert = async (rule: ProxificationRule) => {
@@ -200,10 +239,30 @@ export default function App() {
     apply_profile(next)
   }
 
+  const on_pick_exe = async () => window.proxy_gui.dialog_pick_exe()
+
+  const on_connection_kill = async (connection_id: string) => {
+    const ok = await window.proxy_gui.connection_kill(connection_id)
+    show_toast(ok ? 'Соединение закрыто' : 'Не удалось закрыть', ok ? 'ok' : 'error')
+    await refresh_all()
+  }
+
   const on_settings_save = async (settings: AppProfile['settings']) => {
     const next = await window.proxy_gui.settings_update(settings)
     apply_profile(next)
     show_toast('Настройки сохранены', 'ok')
+  }
+
+  const on_profile_export = async () => window.proxy_gui.profile_export()
+
+  const on_profile_import = async (json_text: string) => {
+    const next = await window.proxy_gui.profile_import(json_text)
+    apply_profile(next)
+    show_toast('Профиль импортирован', 'ok')
+  }
+
+  const on_admin_restart = () => {
+    void window.proxy_gui.admin_restart()
   }
 
   if (!profile || !status) {
@@ -291,6 +350,7 @@ export default function App() {
               logs={logs}
               on_connect={() => void on_connect()}
               on_disconnect={() => void on_disconnect()}
+              on_admin_restart={on_admin_restart}
               busy={busy}
             />
           ) : null}
@@ -301,8 +361,13 @@ export default function App() {
               on_save={on_proxy_save}
               on_delete={on_proxy_delete}
               on_import={on_proxy_import}
+              on_import_bulk={on_proxy_import_bulk}
               on_check={on_proxy_check}
+              on_check_all={on_proxy_check_all}
               on_select={on_select_proxy}
+              on_group_save={on_group_save}
+              on_group_delete={on_group_delete}
+              on_use_group_change={on_use_group_change}
             />
           ) : null}
 
@@ -312,15 +377,27 @@ export default function App() {
               on_upsert={on_rule_upsert}
               on_delete={on_rule_delete}
               on_reorder={on_rule_reorder}
+              on_pick_exe={on_pick_exe}
             />
           ) : null}
 
           {page === 'connections' ? (
-            <ConnectionsPage connections={connections} format_bytes={format_bytes} />
+            <ConnectionsPage
+              connections={connections}
+              format_bytes={format_bytes}
+              on_kill={on_connection_kill}
+            />
           ) : null}
 
           {page === 'settings' ? (
-            <SettingsPage profile={profile} on_save={on_settings_save} is_admin={status.is_admin} />
+            <SettingsPage
+              profile={profile}
+              status={status}
+              on_save={on_settings_save}
+              on_export={on_profile_export}
+              on_import={on_profile_import}
+              on_admin_restart={on_admin_restart}
+            />
           ) : null}
         </main>
       </div>

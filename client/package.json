@@ -1,6 +1,6 @@
 {
   "name": "proxy-gui",
-  "version": "0.2.0",
+  "version": "0.5.1",
   "author": "bogdan-kabanov",
   "description": "Proxifier-like GUI client for SOCKS/HTTPS proxies with TUN and system proxy modes",
   "main": "dist-electron/main.js",
@@ -15,6 +15,7 @@
     "postinstall": "node scripts/download_sing_box.js"
   },
   "dependencies": {
+    "electron-updater": "^6.8.9",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
@@ -56,6 +57,12 @@
       "icon": "build/icon.ico",
       "target": [
         {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
           "target": "msi",
           "arch": [
             "x64"
@@ -66,12 +73,29 @@
       "signAndEditExecutable": false,
       "artifactName": "ProxyGUI-${version}.${ext}"
     },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Proxy GUI",
+      "deleteAppDataOnUninstall": false
+    },
     "msi": {
       "oneClick": false,
       "perMachine": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Proxy GUI"
-    }
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "bogdan-kabanov",
+        "repo": "proxy-gui"
+      }
+    ]
   }
 }

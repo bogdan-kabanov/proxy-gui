@@ -6,6 +6,7 @@ interface RulesPageProps {
   on_upsert: (rule: ProxificationRule) => Promise<void>
   on_delete: (rule_id: string) => Promise<void>
   on_reorder: (rule_ids: string[]) => Promise<void>
+  on_pick_exe: () => Promise<string | null>
 }
 
 function create_empty_rule(): ProxificationRule {
@@ -21,7 +22,7 @@ function create_empty_rule(): ProxificationRule {
   }
 }
 
-export function RulesPage({ profile, on_upsert, on_delete, on_reorder }: RulesPageProps) {
+export function RulesPage({ profile, on_upsert, on_delete, on_reorder, on_pick_exe }: RulesPageProps) {
   const [form, set_form] = useState<ProxificationRule>(create_empty_rule())
   const [applications_text, set_applications_text] = useState('')
   const [hosts_text, set_hosts_text] = useState('')
@@ -49,6 +50,18 @@ export function RulesPage({ profile, on_upsert, on_delete, on_reorder }: RulesPa
     ids[index] = ids[next_index]
     ids[next_index] = temp
     await on_reorder(ids)
+  }
+
+  const append_exe = async () => {
+    const exe_name = await on_pick_exe()
+    if (!exe_name) return
+    const current = applications_text
+      .split(/[;,\n]+/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+    if (current.includes(exe_name)) return
+    const next = [...current, exe_name].join('; ')
+    set_applications_text(next)
   }
 
   const submit = async () => {
@@ -158,12 +171,18 @@ export function RulesPage({ profile, on_upsert, on_delete, on_reorder }: RulesPa
             </div>
             <div className="field">
               <label htmlFor="rule_apps">Applications</label>
-              <input
-                id="rule_apps"
-                value={applications_text}
-                onChange={(event) => set_applications_text(event.target.value)}
-                placeholder="chrome.exe; firefox.exe"
-              />
+              <div className="row_actions">
+                <input
+                  id="rule_apps"
+                  value={applications_text}
+                  onChange={(event) => set_applications_text(event.target.value)}
+                  placeholder="chrome.exe; firefox.exe"
+                  style={{ flex: 1 }}
+                />
+                <button className="btn btn_secondary" type="button" onClick={() => void append_exe()}>
+                  Pick .exe
+                </button>
+              </div>
             </div>
             <div className="field">
               <label htmlFor="rule_ports">Ports</label>
@@ -182,6 +201,7 @@ export function RulesPage({ profile, on_upsert, on_delete, on_reorder }: RulesPa
                 onChange={(event) => set_hosts_text(event.target.value)}
                 placeholder="*.example.com; 192.168.0.0/16"
               />
+              <div className="field_hint">*.example.com сохраняется как domain_suffix</div>
             </div>
             <div className="field">
               <label htmlFor="rule_enabled">Enabled</label>

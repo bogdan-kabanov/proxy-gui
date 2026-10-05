@@ -3,14 +3,17 @@ import fs from 'node:fs'
 import net from 'node:net'
 import path from 'node:path'
 import { app } from 'electron'
-import { get_runtime_config_path, patch_profile } from './profile_store'
-import { enable_system_proxy, restore_system_proxy } from './system_proxy'
+import { resolve_wintun_ready } from './elevate'
+import { check_proxy_full, detect_proxy_protocol_quick } from './proxy_check'
+import { get_runtime_config_path, patch_profile, update_proxy_check_meta } from './profile_store'
+import { enable_system_proxy, read_system_proxy, restore_system_proxy } from './system_proxy'
 import type {
   AppProfile,
   ConnectionStatus,
   LiveConnection,
   ProxificationRule,
   ProxyCheckResult,
+  ProxyGroup,
   ProxyServer,
   WorkMode,
 } from './types'
@@ -31,6 +34,8 @@ const engine_state: EngineState = {
     upload_bytes: 0,
     download_bytes: 0,
     is_admin: false,
+    wintun_ready: false,
+    system_proxy_enabled: false,
     started_at: null,
   },
   log_buffer: [],
@@ -88,6 +93,29 @@ function is_ip_literal(value: string): boolean {
   return net.isIP(value) !== 0 || is_cidr(value)
 }
 
+function classify_host(host: string): { domain: string[]; domain_suffix: string[]; ip_cidr: string[] } {
+  const trimmed = host.trim()
+  if (!trimmed) return { domain: [], domain_suffix: [], ip_cidr: [] }
+
+  if (is_ip_literal(trimmed)) {
+    return {
+      domain: [],
+      domain_suffix: [],
+      ip_cidr: [trimmed.includes('/') ? trimmed : `${trimmed}/32`],
+    }
+  }
+
+  if (trimmed.startsWith('*.')) {
+    return { domain: [], domain_suffix: [trimmed.slice(2)], ip_cidr: [] }
+  }
+
+  if (trimmed.startsWith('.')) {
+    return { domain: [], domain_suffix: [trimmed.slice(1)], ip_cidr: [] }
+  }
+
+  return { domain: [trimmed], domain_suffix: [], ip_cidr: [] }
+}
+
 function build_rule_objects(rule: ProxificationRule): Record<string, unknown>[] {
   if (!rule.enabled) return []
 
@@ -96,16 +124,12 @@ function build_rule_objects(rule: ProxificationRule): Record<string, unknown>[] 
       ? { action: 'reject' }
       : { outbound: rule.action === 'proxy' ? 'proxy' : 'direct' }
 
-  const domains: string[] = []
-  const ip_cidrs: string[] = []
+  const domain_buckets = { domain: [] as string[], domain_suffix: [] as string[], ip_cidr: [] as string[] }
   for (const host of rule.hosts) {
-    const trimmed = host.trim()
-    if (!trimmed) continue
-    if (is_ip_literal(trimmed)) {
-      ip_cidrs.push(trimmed.includes('/') ? trimmed : `${trimmed}/32`)
-    } else {
-      domains.push(trimmed)
-    }
+    const classified = classify_host(host)
+    domain_buckets.domain.push(...classified.domain)
+    domain_buckets.domain_suffix.push(...classified.domain_suffix)
+    domain_buckets.ip_cidr.push(...classified.ip_cidr)
   }
 
   const ports = parse_ports(rule.ports)
@@ -119,11 +143,14 @@ function build_rule_objects(rule: ProxificationRule): Record<string, unknown>[] 
   }
 
   const rules: Record<string, unknown>[] = []
-  if (domains.length > 0) {
-    rules.push(make_rule({ domain: domains }))
+  if (domain_buckets.domain.length > 0) {
+    rules.push(make_rule({ domain: domain_buckets.domain }))
   }
-  if (ip_cidrs.length > 0) {
-    rules.push(make_rule({ ip_cidr: ip_cidrs }))
+  if (domain_buckets.domain_suffix.length > 0) {
+    rules.push(make_rule({ domain_suffix: domain_buckets.domain_suffix }))
+  }
+  if (domain_buckets.ip_cidr.length > 0) {
+    rules.push(make_rule({ ip_cidr: domain_buckets.ip_cidr }))
   }
 
   if (rules.length === 0) {
@@ -143,97 +170,10 @@ function protocol_to_outbound_type(protocol: ProxyServer['protocol']): string {
   return 'http'
 }
 
-export async function detect_proxy_protocol(proxy: ProxyServer): Promise<ProxyServer> {
-  const auth = Buffer.from(`${proxy.username}:${proxy.password}`).toString('base64')
-
-  const http_ok = await new Promise<boolean>((resolve) => {
-    const socket = net.connect({ host: proxy.host, port: proxy.port })
-    const timer = setTimeout(() => {
-      socket.destroy()
-      resolve(false)
-    }, 4000)
-
-    socket.on('connect', () => {
-      socket.write(
-        `GET http://api.ipify.org/ HTTP/1.1\r\nHost: api.ipify.org\r\nProxy-Authorization: Basic ${auth}\r\nConnection: close\r\n\r\n`,
-      )
-    })
-    socket.on('data', (chunk) => {
-      clearTimeout(timer)
-      const text = chunk.toString('utf8')
-      socket.destroy()
-      resolve(text.includes('HTTP/1.') && text.includes('200'))
-    })
-    socket.on('error', () => {
-      clearTimeout(timer)
-      resolve(false)
-    })
-  })
-
-  if (http_ok) {
-    return { ...proxy, protocol: 'http' }
-  }
-
-  const socks_ok = await new Promise<boolean>((resolve) => {
-    const socket = net.connect({ host: proxy.host, port: proxy.port })
-    const timer = setTimeout(() => {
-      socket.destroy()
-      resolve(false)
-    }, 3000)
-    socket.on('connect', () => {
-      socket.write(Buffer.from([0x05, 0x01, 0x02]))
-    })
-    socket.on('data', (chunk) => {
-      clearTimeout(timer)
-      socket.destroy()
-      resolve(chunk.length >= 2 && chunk[0] === 0x05)
-    })
-    socket.on('error', () => {
-      clearTimeout(timer)
-      resolve(false)
-    })
-  })
-
-  if (socks_ok) {
-    return { ...proxy, protocol: 'socks5' }
-  }
-
-  return proxy
-}
-
-export function build_sing_box_config(profile: AppProfile, proxy: ProxyServer): Record<string, unknown> {
-  const route_rules = profile.rules.flatMap(build_rule_objects)
-  const is_http_family = proxy.protocol === 'http' || proxy.protocol === 'https'
-
-  const inbounds: Record<string, unknown>[] = [
-    {
-      type: 'mixed',
-      tag: 'mixed-in',
-      listen: '127.0.0.1',
-      listen_port: profile.settings.mixed_port,
-      set_system_proxy: false,
-    },
-  ]
-
-  if (profile.work_mode === 'tun') {
-    inbounds.push({
-      type: 'tun',
-      tag: 'tun-in',
-      interface_name: 'ProxyGUI',
-      address: ['172.19.0.1/30'],
-      mtu: 1500,
-      auto_route: true,
-      // strict_route breaks VirtualBox/WSL/some apps and can blackhole traffic
-      strict_route: false,
-      stack: 'mixed',
-      sniff: true,
-      sniff_override_destination: false,
-    })
-  }
-
+function build_proxy_outbound(proxy: ProxyServer, tag: string): Record<string, unknown> {
   const outbound: Record<string, unknown> = {
     type: protocol_to_outbound_type(proxy.protocol),
-    tag: 'proxy',
+    tag,
     server: proxy.host,
     server_port: proxy.port,
   }
@@ -255,7 +195,107 @@ export function build_sing_box_config(profile: AppProfile, proxy: ProxyServer): 
     outbound.tls = { enabled: true }
   }
 
-  // HTTP proxies cannot carry raw UDP DNS. Use DoH through the proxy instead.
+  return outbound
+}
+
+export async function detect_proxy_protocol(proxy: ProxyServer): Promise<ProxyServer> {
+  const protocol = await detect_proxy_protocol_quick(proxy)
+  return { ...proxy, protocol }
+}
+
+function resolve_active_proxies(profile: AppProfile): ProxyServer[] {
+  if (profile.settings.use_proxy_group && profile.settings.selected_group_id) {
+    const group = profile.proxy_groups.find((item) => item.id === profile.settings.selected_group_id)
+    if (group) {
+      const proxies = group.proxy_ids
+        .map((id) => profile.proxies.find((proxy) => proxy.id === id))
+        .filter((proxy): proxy is ProxyServer => Boolean(proxy?.enabled))
+      if (proxies.length > 0) return proxies
+    }
+  }
+
+  const single = profile.proxies.find((item) => item.id === profile.selected_proxy_id && item.enabled)
+  return single ? [single] : []
+}
+
+function build_group_selector(
+  group: ProxyGroup,
+  proxy_tags: string[],
+): Record<string, unknown> {
+  if (group.mode === 'urltest') {
+    return {
+      type: 'urltest',
+      tag: 'proxy',
+      outbounds: proxy_tags,
+      url: 'http://www.gstatic.com/generate_204',
+      interval: '3m',
+      tolerance: 50,
+    }
+  }
+
+  const default_tag =
+    group.selected_proxy_id &&
+    proxy_tags.includes(`proxy-${group.selected_proxy_id}`)
+      ? `proxy-${group.selected_proxy_id}`
+      : proxy_tags[0]
+
+  return {
+    type: 'selector',
+    tag: 'proxy',
+    outbounds: proxy_tags,
+    default: default_tag,
+  }
+}
+
+export function build_sing_box_config(profile: AppProfile, active_proxies: ProxyServer[]): Record<string, unknown> {
+  const route_rules = profile.rules.flatMap(build_rule_objects)
+  const primary_proxy = active_proxies[0]
+  const is_http_family =
+    primary_proxy.protocol === 'http' || primary_proxy.protocol === 'https'
+
+  const inbounds: Record<string, unknown>[] = [
+    {
+      type: 'mixed',
+      tag: 'mixed-in',
+      listen: '127.0.0.1',
+      listen_port: profile.settings.mixed_port,
+      set_system_proxy: false,
+    },
+  ]
+
+  if (profile.work_mode === 'tun') {
+    inbounds.push({
+      type: 'tun',
+      tag: 'tun-in',
+      interface_name: 'ProxyGUI',
+      address: ['172.19.0.1/30'],
+      mtu: 1500,
+      auto_route: true,
+      strict_route: false,
+      stack: 'mixed',
+      sniff: true,
+      sniff_override_destination: false,
+    })
+  }
+
+  const proxy_outbounds = active_proxies.map((proxy) =>
+    build_proxy_outbound(proxy, active_proxies.length === 1 ? 'proxy' : `proxy-${proxy.id}`),
+  )
+
+  const outbounds: Record<string, unknown>[] = [...proxy_outbounds, { type: 'direct', tag: 'direct' }]
+
+  if (active_proxies.length > 1 && profile.settings.use_proxy_group && profile.settings.selected_group_id) {
+    const group = profile.proxy_groups.find((item) => item.id === profile.settings.selected_group_id)
+    if (group) {
+      outbounds.push(
+        build_group_selector(
+          group,
+          active_proxies.map((proxy) => `proxy-${proxy.id}`),
+        ),
+      )
+    }
+  }
+
   const dns_servers: Record<string, unknown>[] = [
     {
       tag: 'local',
@@ -286,18 +326,16 @@ export function build_sing_box_config(profile: AppProfile, proxy: ProxyServer): 
         ? 'direct'
         : 'proxy'
 
-  const proxy_ip_rule =
-    net.isIP(proxy.host) !== 0
-      ? [{ ip_cidr: [`${proxy.host}/32`], outbound: 'direct' }]
-      : [{ domain: [proxy.host], outbound: 'direct' }]
+  const proxy_bypass_rules = active_proxies.flatMap((proxy) => {
+    if (net.isIP(proxy.host) !== 0) {
+      return [{ ip_cidr: [`${proxy.host}/32`], outbound: 'direct' }]
+    }
+    return [{ domain: [proxy.host], outbound: 'direct' }]
+  })
 
-  const compatibility_rules: Record<string, unknown>[] = [
-    // YouTube/Chrome break when QUIC/UDP-443 cannot traverse HTTP proxies.
-    { protocol: 'quic', action: 'reject' },
-  ]
+  const compatibility_rules: Record<string, unknown>[] = [{ protocol: 'quic', action: 'reject' }]
 
   if (is_http_family) {
-    // HTTP CONNECT is TCP-only; send remaining UDP direct so apps do not hang.
     compatibility_rules.push({ network: 'udp', outbound: 'direct' })
   }
 
@@ -313,14 +351,11 @@ export function build_sing_box_config(profile: AppProfile, proxy: ProxyServer): 
       independent_cache: true,
     },
     inbounds,
-    outbounds: [
-      outbound,
-      { type: 'direct', tag: 'direct' },
-    ],
+    outbounds,
     route: {
       rules: [
         { protocol: 'dns', action: 'hijack-dns' },
-        ...proxy_ip_rule,
+        ...proxy_bypass_rules,
         { ip_is_private: true, outbound: 'direct' },
         ...compatibility_rules,
         ...route_rules,
@@ -345,11 +380,18 @@ function push_log(line: string): void {
   }
 }
 
+function read_system_proxy_enabled(): boolean {
+  const snapshot = read_system_proxy()
+  return snapshot.proxy_enable === 1
+}
+
 function update_status(partial: Partial<ConnectionStatus>): ConnectionStatus {
   engine_state.status = {
     ...engine_state.status,
     ...partial,
     is_admin: check_is_admin(),
+    wintun_ready: resolve_wintun_ready(),
+    system_proxy_enabled: read_system_proxy_enabled(),
   }
   return engine_state.status
 }
@@ -371,10 +413,7 @@ async function wait_for_port(port: number, timeout_ms = 8000): Promise<boolean> 
 }
 
 export function get_connection_status(): ConnectionStatus {
-  return {
-    ...engine_state.status,
-    is_admin: check_is_admin(),
-  }
+  return update_status({})
 }
 
 export function get_engine_logs(): string[] {
@@ -406,7 +445,9 @@ export async function stop_engine(): Promise<ConnectionStatus> {
 export async function start_engine(profile: AppProfile): Promise<ConnectionStatus> {
   await stop_engine()
 
-  let proxy = profile.proxies.find((item) => item.id === profile.selected_proxy_id)
+  const active_proxies = resolve_active_proxies(profile)
+  const proxy = active_proxies[0]
+
   if (!proxy) {
     return update_status({
       state: 'error',
@@ -434,37 +475,35 @@ export async function start_engine(profile: AppProfile): Promise<ConnectionStatu
     })
   }
 
-  if (profile.work_mode === 'tun') {
-    const wintun_path = path.join(resolve_sing_box_dir(), 'wintun.dll')
-    if (!fs.existsSync(wintun_path)) {
-      return update_status({
-        state: 'error',
-        work_mode: profile.work_mode,
-        selected_proxy_id: proxy.id,
-        message: 'Не найден wintun.dll. Запустите npm run download:sing-box',
-      })
-    }
+  if (profile.work_mode === 'tun' && !resolve_wintun_ready()) {
+    return update_status({
+      state: 'error',
+      work_mode: profile.work_mode,
+      selected_proxy_id: proxy.id,
+      message: 'Не найден wintun.dll. Запустите npm run download:sing-box',
+    })
   }
 
   engine_state.log_buffer = []
   push_log(`INFO detecting protocol for ${proxy.host}:${proxy.port} (saved as ${proxy.protocol})`)
-  const detected = await detect_proxy_protocol(proxy)
-  if (detected.protocol !== proxy.protocol) {
-    push_log(`INFO auto-switched protocol ${proxy.protocol} -> ${detected.protocol}`)
-    const updated_proxy: ProxyServer = {
-      ...detected,
-      name:
-        detected.protocol === 'http' && proxy.name.includes('SOCKS')
-          ? 'Seed HTTP'
-          : proxy.name,
+
+  const detected_proxies: ProxyServer[] = []
+  for (const item of active_proxies) {
+    const detected = await detect_proxy_protocol(item)
+    if (detected.protocol !== item.protocol) {
+      push_log(`INFO auto-switched protocol ${item.protocol} -> ${detected.protocol} (${item.host})`)
+    } else {
+      push_log(`INFO protocol confirmed: ${item.protocol} (${item.host})`)
     }
-    proxy = updated_proxy
-    patch_profile({
-      proxies: profile.proxies.map((item) => (item.id === updated_proxy.id ? updated_proxy : item)),
-    })
-  } else {
-    push_log(`INFO protocol confirmed: ${proxy.protocol}`)
+    detected_proxies.push(detected)
   }
+
+  patch_profile({
+    proxies: profile.proxies.map((item) => {
+      const updated = detected_proxies.find((proxy_item) => proxy_item.id === item.id)
+      return updated ?? item
+    }),
+  })
 
   update_status({
     state: 'connecting',
@@ -473,7 +512,7 @@ export async function start_engine(profile: AppProfile): Promise<ConnectionStatu
     message: 'Запуск sing-box…',
   })
 
-  const config = build_sing_box_config(profile, proxy)
+  const config = build_sing_box_config(profile, detected_proxies)
   const config_path = get_runtime_config_path()
   fs.writeFileSync(config_path, JSON.stringify(config, null, 2), 'utf8')
 
@@ -520,7 +559,6 @@ export async function start_engine(profile: AppProfile): Promise<ConnectionStatu
     })
   }
 
-  // Verify remote proxy path before touching OS settings.
   const probe_ok = await probe_local_mixed(profile.settings.mixed_port)
   if (!probe_ok) {
     const tail = engine_state.log_buffer.slice(-6).join(' | ')
@@ -533,10 +571,10 @@ export async function start_engine(profile: AppProfile): Promise<ConnectionStatu
     })
   }
 
-  if (profile.work_mode === 'proxy') {
-    try {
-      enable_system_proxy('127.0.0.1', profile.settings.mixed_port)
-    } catch (error) {
+  try {
+    enable_system_proxy('127.0.0.1', profile.settings.mixed_port)
+  } catch (error) {
+    if (profile.work_mode === 'proxy') {
       await stop_engine()
       return update_status({
         state: 'error',
@@ -545,14 +583,13 @@ export async function start_engine(profile: AppProfile): Promise<ConnectionStatu
         message: `Не удалось включить системный прокси: ${String(error)}`,
       })
     }
-  } else {
-    // TUN + system proxy: browsers/Cursor that honor WinINET also work reliably.
-    try {
-      enable_system_proxy('127.0.0.1', profile.settings.mixed_port)
-    } catch (error) {
-      push_log(`WARN system proxy helper failed in TUN mode: ${String(error)}`)
-    }
+    push_log(`WARN system proxy helper failed in TUN mode: ${String(error)}`)
   }
+
+  const group_label =
+    profile.settings.use_proxy_group && active_proxies.length > 1
+      ? ` · group ${active_proxies.length}`
+      : ''
 
   return update_status({
     state: 'connected',
@@ -560,8 +597,8 @@ export async function start_engine(profile: AppProfile): Promise<ConnectionStatu
     selected_proxy_id: proxy.id,
     message:
       profile.work_mode === 'tun'
-        ? `TUN активен (${proxy.protocol.toUpperCase()})`
-        : `Системный прокси активен (${proxy.protocol.toUpperCase()})`,
+        ? `TUN активен (${proxy.protocol.toUpperCase()}${group_label})`
+        : `Системный прокси активен (${proxy.protocol.toUpperCase()}${group_label})`,
     started_at: new Date().toISOString(),
   })
 }
@@ -592,39 +629,26 @@ async function probe_local_mixed(mixed_port: number): Promise<boolean> {
   })
 }
 
-export async function check_proxy(proxy: ProxyServer, timeout_ms = 8000): Promise<ProxyCheckResult> {
-  const started = Date.now()
-  return new Promise((resolve) => {
-    const socket = net.connect({ host: proxy.host, port: proxy.port })
-    const timer = setTimeout(() => {
-      socket.destroy()
-      resolve({
-        ok: false,
-        latency_ms: null,
-        message: 'Таймаут подключения',
-      })
-    }, timeout_ms)
-
-    socket.on('connect', () => {
-      clearTimeout(timer)
-      const latency_ms = Date.now() - started
-      socket.destroy()
-      resolve({
-        ok: true,
-        latency_ms,
-        message: `TCP OK (${latency_ms} ms)`,
-      })
+export async function check_proxy(proxy: ProxyServer, timeout_ms = 12000): Promise<ProxyCheckResult> {
+  const result = await check_proxy_full(proxy, timeout_ms)
+  if (result.ok) {
+    update_proxy_check_meta(proxy.id, {
+      last_latency_ms: result.latency_ms,
+      last_exit_ip: result.exit_ip,
+      last_checked_at: new Date().toISOString(),
+      protocol: result.protocol ?? proxy.protocol,
     })
+  }
+  return result
+}
 
-    socket.on('error', (error) => {
-      clearTimeout(timer)
-      resolve({
-        ok: false,
-        latency_ms: null,
-        message: error.message,
-      })
-    })
-  })
+export async function check_all_proxies_latency(profile: AppProfile): Promise<AppProfile> {
+  const sorted = [...profile.proxies]
+  for (const proxy of sorted) {
+    if (!proxy.enabled) continue
+    await check_proxy(proxy)
+  }
+  return profile
 }
 
 export async function fetch_live_connections(clash_api_port: number): Promise<LiveConnection[]> {
@@ -671,6 +695,18 @@ export async function fetch_live_connections(clash_api_port: number): Promise<Li
     })
   } catch {
     return []
+  }
+}
+
+export async function kill_connection(clash_api_port: number, connection_id: string): Promise<boolean> {
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${clash_api_port}/connections/${encodeURIComponent(connection_id)}`,
+      { method: 'DELETE' },
+    )
+    return response.ok
+  } catch {
+    return false
   }
 }
 

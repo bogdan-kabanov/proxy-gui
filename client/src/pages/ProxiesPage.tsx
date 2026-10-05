@@ -1,13 +1,25 @@
 import { useMemo, useState } from 'react'
-import type { AppProfile, ProxyCheckResult, ProxyProtocol, ProxyServer } from '../types'
+import type {
+  AppProfile,
+  ProxyCheckResult,
+  ProxyGroup,
+  ProxyGroupMode,
+  ProxyProtocol,
+  ProxyServer,
+} from '../types'
 
 interface ProxiesPageProps {
   profile: AppProfile
   on_save: (proxy: ProxyServer, is_new: boolean) => Promise<void>
   on_delete: (proxy_id: string) => Promise<void>
   on_import: (line: string) => Promise<void>
+  on_import_bulk: (text: string) => Promise<{ imported: number; skipped: number }>
   on_check: (proxy: ProxyServer) => Promise<ProxyCheckResult>
+  on_check_all: () => Promise<void>
   on_select: (proxy_id: string) => Promise<void>
+  on_group_save: (group: ProxyGroup) => Promise<void>
+  on_group_delete: (group_id: string) => Promise<void>
+  on_use_group_change: (use_group: boolean, group_id: string | null) => Promise<void>
 }
 
 const EMPTY_FORM: ProxyServer = {
@@ -19,6 +31,19 @@ const EMPTY_FORM: ProxyServer = {
   username: '',
   password: '',
   enabled: true,
+  last_latency_ms: null,
+  last_exit_ip: null,
+  last_checked_at: null,
+}
+
+function create_empty_group(): ProxyGroup {
+  return {
+    id: crypto.randomUUID(),
+    name: '',
+    proxy_ids: [],
+    mode: 'urltest',
+    selected_proxy_id: null,
+  }
 }
 
 export function ProxiesPage({
@@ -26,24 +51,54 @@ export function ProxiesPage({
   on_save,
   on_delete,
   on_import,
+  on_import_bulk,
   on_check,
+  on_check_all,
   on_select,
+  on_group_save,
+  on_group_delete,
+  on_use_group_change,
 }: ProxiesPageProps) {
   const [form, set_form] = useState<ProxyServer>(EMPTY_FORM)
   const [import_line, set_import_line] = useState('')
+  const [bulk_text, set_bulk_text] = useState('')
   const [checking_id, set_checking_id] = useState<string | null>(null)
+  const [group_form, set_group_form] = useState<ProxyGroup>(create_empty_group())
+  const [checking_all, set_checking_all] = useState(false)
   const is_editing = Boolean(form.id)
 
-  const sorted_proxies = useMemo(() => profile.proxies, [profile.proxies])
+  const sorted_proxies = useMemo(
+    () =>
+      [...profile.proxies].sort((a, b) => {
+        const la = a.last_latency_ms ?? Number.MAX_SAFE_INTEGER
+        const lb = b.last_latency_ms ?? Number.MAX_SAFE_INTEGER
+        return la - lb
+      }),
+    [profile.proxies],
+  )
 
   const reset_form = () => set_form(EMPTY_FORM)
 
   const submit = async () => {
-    if (!form.name.trim() || !form.host.trim() || !form.port) {
-      return
-    }
+    if (!form.name.trim() || !form.host.trim() || !form.port) return
     await on_save(form, !is_editing)
     reset_form()
+  }
+
+  const submit_group = async () => {
+    if (!group_form.name.trim() || group_form.proxy_ids.length === 0) return
+    await on_group_save(group_form)
+    set_group_form(create_empty_group())
+  }
+
+  const toggle_group_proxy = (proxy_id: string) => {
+    const has = group_form.proxy_ids.includes(proxy_id)
+    set_group_form({
+      ...group_form,
+      proxy_ids: has
+        ? group_form.proxy_ids.filter((id) => id !== proxy_id)
+        : [...group_form.proxy_ids, proxy_id],
+    })
   }
 
   return (
@@ -51,6 +106,17 @@ export function ProxiesPage({
       <section className="panel">
         <div className="panel_header">
           <h2>Список серверов</h2>
+          <button
+            className="btn btn_secondary"
+            type="button"
+            disabled={checking_all}
+            onClick={() => {
+              set_checking_all(true)
+              void on_check_all().finally(() => set_checking_all(false))
+            }}
+          >
+            Check all
+          </button>
         </div>
         <div className="panel_body table_wrap">
           {sorted_proxies.length === 0 ? (
@@ -62,7 +128,8 @@ export function ProxiesPage({
                   <th>Имя</th>
                   <th>Протокол</th>
                   <th>Адрес</th>
-                  <th>Auth</th>
+                  <th>Exit IP</th>
+                  <th>Latency</th>
                   <th />
                 </tr>
               </thead>
@@ -77,7 +144,10 @@ export function ProxiesPage({
                     <td className="mono">
                       {proxy.host}:{proxy.port}
                     </td>
-                    <td>{proxy.username ? proxy.username : '—'}</td>
+                    <td className="mono">{proxy.last_exit_ip ?? '—'}</td>
+                    <td className="mono">
+                      {proxy.last_latency_ms != null ? `${proxy.last_latency_ms} ms` : '—'}
+                    </td>
                     <td>
                       <div className="row_actions">
                         <button
@@ -98,11 +168,7 @@ export function ProxiesPage({
                         >
                           Check
                         </button>
-                        <button
-                          className="btn btn_ghost"
-                          type="button"
-                          onClick={() => set_form(proxy)}
-                        >
+                        <button className="btn btn_ghost" type="button" onClick={() => set_form(proxy)}>
                           Edit
                         </button>
                         <button
@@ -119,6 +185,138 @@ export function ProxiesPage({
               </tbody>
             </table>
           )}
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="panel_header">
+          <h2>Proxy groups</h2>
+          <div className="row_actions">
+            <label className="field_hint">
+              <input
+                type="checkbox"
+                checked={profile.settings.use_proxy_group}
+                onChange={(event) =>
+                  void on_use_group_change(
+                    event.target.checked,
+                    profile.settings.selected_group_id ?? profile.proxy_groups[0]?.id ?? null,
+                  )
+                }
+              />{' '}
+              Use group on Connect
+            </label>
+          </div>
+        </div>
+        <div className="panel_body">
+          {profile.proxy_groups.length === 0 ? (
+            <div className="empty_state">Нет групп — создайте ниже для failover / url-test</div>
+          ) : (
+            <table className="data">
+              <thead>
+                <tr>
+                  <th>Имя</th>
+                  <th>Mode</th>
+                  <th>Proxies</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {profile.proxy_groups.map((group) => (
+                  <tr
+                    key={group.id}
+                    className={
+                      profile.settings.selected_group_id === group.id ? 'selected' : ''
+                    }
+                  >
+                    <td>{group.name}</td>
+                    <td>{group.mode}</td>
+                    <td>{group.proxy_ids.length}</td>
+                    <td>
+                      <div className="row_actions">
+                        <button
+                          className="btn btn_secondary"
+                          type="button"
+                          onClick={() =>
+                            void on_use_group_change(true, group.id)
+                          }
+                        >
+                          Select
+                        </button>
+                        <button
+                          className="btn btn_ghost"
+                          type="button"
+                          onClick={() => set_group_form(group)}
+                        >
+                          Edit
+                        </button>
+                        <button
+                          className="btn btn_danger"
+                          type="button"
+                          onClick={() => void on_group_delete(group.id)}
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+
+          <div className="form_grid" style={{ marginTop: 16 }}>
+            <div className="field">
+              <label htmlFor="group_name">Group name</label>
+              <input
+                id="group_name"
+                value={group_form.name}
+                onChange={(event) => set_group_form({ ...group_form, name: event.target.value })}
+              />
+            </div>
+            <div className="field">
+              <label htmlFor="group_mode">Mode</label>
+              <select
+                id="group_mode"
+                value={group_form.mode}
+                onChange={(event) =>
+                  set_group_form({
+                    ...group_form,
+                    mode: event.target.value as ProxyGroupMode,
+                  })
+                }
+              >
+                <option value="urltest">URL-test (latency failover)</option>
+                <option value="select">Manual select</option>
+              </select>
+            </div>
+          </div>
+          <div className="field" style={{ marginTop: 12 }}>
+            <label>Proxies in group</label>
+            <div className="stack" style={{ gap: 6 }}>
+              {profile.proxies.map((proxy) => (
+                <label key={proxy.id} className="field_hint">
+                  <input
+                    type="checkbox"
+                    checked={group_form.proxy_ids.includes(proxy.id)}
+                    onChange={() => toggle_group_proxy(proxy.id)}
+                  />{' '}
+                  {proxy.name} ({proxy.host}:{proxy.port})
+                </label>
+              ))}
+            </div>
+          </div>
+          <div className="row_actions" style={{ marginTop: 14 }}>
+            <button className="btn btn_primary" type="button" onClick={() => void submit_group()}>
+              Save group
+            </button>
+            <button
+              className="btn btn_secondary"
+              type="button"
+              onClick={() => set_group_form(create_empty_group())}
+            >
+              Reset
+            </button>
+          </div>
         </div>
       </section>
 
@@ -201,20 +399,19 @@ export function ProxiesPage({
 
         <section className="panel">
           <div className="panel_header">
-            <h2>Импорт строки</h2>
+            <h2>Импорт</h2>
           </div>
-          <div className="panel_body">
+          <div className="panel_body stack">
             <div className="field">
-              <label htmlFor="import_line">host:port:user:pass</label>
+              <label htmlFor="import_line">Одна строка host:port:user:pass</label>
               <input
                 id="import_line"
                 value={import_line}
                 onChange={(event) => set_import_line(event.target.value)}
-                placeholder="45.11.183.190:11707:user:pass"
+                placeholder="host:port:user:pass"
               />
-              <div className="field_hint">По умолчанию импортируется как HTTP (CONNECT)</div>
             </div>
-            <div className="row_actions" style={{ marginTop: 14 }}>
+            <div className="row_actions">
               <button
                 className="btn btn_secondary"
                 type="button"
@@ -222,7 +419,29 @@ export function ProxiesPage({
                   void on_import(import_line).then(() => set_import_line(''))
                 }}
               >
-                Import
+                Import line
+              </button>
+            </div>
+            <div className="field">
+              <label htmlFor="bulk_text">Bulk import (по строке на прокси)</label>
+              <textarea
+                id="bulk_text"
+                value={bulk_text}
+                onChange={(event) => set_bulk_text(event.target.value)}
+                placeholder={'host:port:user:pass\nhost2:port:user:pass'}
+                rows={6}
+              />
+              <div className="field_hint">Протокол определяется автоматически при импорте</div>
+            </div>
+            <div className="row_actions">
+              <button
+                className="btn btn_primary"
+                type="button"
+                onClick={() => {
+                  void on_import_bulk(bulk_text).then(() => set_bulk_text(''))
+                }}
+              >
+                Bulk import
               </button>
             </div>
           </div>

@@ -1,12 +1,18 @@
 export type {
   AppProfile,
+  AppProfilePatch,
   AppSettings,
+  BulkImportResult,
   ConnectionStatus,
   LiveConnection,
   ProxificationRule,
   ProxyCheckResult,
+  ProxyGroup,
+  ProxyGroupMode,
   ProxyProtocol,
   ProxyServer,
   RuleAction,
+  UpdateState,
+  UpdateStatus,
   WorkMode,
 } from '../electron/types'
