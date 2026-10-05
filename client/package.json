@@ -1,6 +1,7 @@
 {
   "name": "proxy-gui",
   "version": "0.2.0",
+  "author": "bogdan-kabanov",
   "description": "Proxifier-like GUI client for SOCKS/HTTPS proxies with TUN and system proxy modes",
   "main": "dist-electron/main.js",
   "private": true,
@@ -32,8 +33,10 @@
   "build": {
     "appId": "com.proxygui.app",
     "productName": "Proxy GUI",
+    "icon": "build/icon.ico",
     "directories": {
-      "output": "release"
+      "output": "release",
+      "buildResources": "build"
     },
     "files": [
       "dist/**/*",
@@ -50,6 +53,7 @@
       }
     ],
     "win": {
+      "icon": "build/icon.ico",
       "target": [
         {
           "target": "msi",
@@ -58,7 +62,9 @@
           ]
         }
       ],
-      "requestedExecutionLevel": "highestAvailable"
+      "requestedExecutionLevel": "highestAvailable",
+      "signAndEditExecutable": false,
+      "artifactName": "ProxyGUI-${version}.${ext}"
     },
     "msi": {
       "oneClick": false,
